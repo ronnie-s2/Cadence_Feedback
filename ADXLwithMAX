@@ -1,0 +1,195 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+MAX30105 particleSensor;
+
+// =====================================================
+// ADXL335 PINS
+// Change these if your wiring is different
+// =====================================================
+const int xInput = 33;
+const int yInput = 32;
+const int zInput = 34;
+
+// ESP32 ADC is 12-bit: 0 to 4095
+const int RawMin = 0;
+const int RawMax = 4095;
+const int sampleSize = 10;
+
+// =====================================================
+// HEART RATE VARIABLES
+// =====================================================
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+
+long lastBeat = 0;
+float beatsPerMinute = 0;
+int beatAvg = 0;
+
+// =====================================================
+// STEP DETECTION VARIABLES
+// =====================================================
+float accelFiltered = 0;
+float accelBaseline = 0;
+
+bool stepDetected = false;
+unsigned long lastStepTime = 0;
+
+// Tune these if needed
+const float STEP_THRESHOLD = 0.35;      // increase if false steps happen
+const unsigned long STEP_COOLDOWN = 300; // ms between steps
+const unsigned long STEP_REJECT_WINDOW = 250; // reject HR if step happened within this time
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("Initializing MAX30102 + ADXL335...");
+
+  // -------------------------------
+  // ADXL335 setup
+  // -------------------------------
+  analogReadResolution(12);
+  analogSetPinAttenuation(xInput, ADC_11db);
+  analogSetPinAttenuation(yInput, ADC_11db);
+  analogSetPinAttenuation(zInput, ADC_11db);
+
+  // -------------------------------
+  // MAX30102 setup
+  // -------------------------------
+  Wire.begin(21, 22); // ESP32 default SDA = 21, SCL = 22
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 was not found. Check wiring/power.");
+    while (1);
+  }
+
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeGreen(0);
+
+  Serial.println("Place finger on MAX30102.");
+  Serial.println("Step filter active.");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+  unsigned long now = millis();
+
+  // Read accelerometer and check for step
+  updateStepDetection(now);
+
+  // Read PPG
+  long irValue = particleSensor.getIR();
+
+  if (checkForBeat(irValue) == true) {
+    long beatTime = millis();
+
+    if (lastBeat > 0) {
+      long delta = beatTime - lastBeat;
+      beatsPerMinute = 60.0 / (delta / 1000.0);
+
+      bool motionAtBeat = (beatTime - lastStepTime) < STEP_REJECT_WINDOW;
+
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+
+        if (motionAtBeat) {
+          // Throw away this HR reading because a step happened nearby
+          Serial.print("REJECTED BPM due to step: ");
+          Serial.println(beatsPerMinute);
+        } 
+        else {
+          // Accept this HR reading
+          rates[rateSpot++] = (byte)beatsPerMinute;
+          rateSpot %= RATE_SIZE;
+
+          beatAvg = 0;
+          for (byte i = 0; i < RATE_SIZE; i++) {
+            beatAvg += rates[i];
+          }
+          beatAvg /= RATE_SIZE;
+        }
+      }
+    }
+
+    // Still update lastBeat so the next BPM timing does not get messed up
+    lastBeat = beatTime;
+  }
+
+  // Print data
+  Serial.print("IR=");
+  Serial.print(irValue);
+
+  Serial.print(", BPM=");
+  Serial.print(beatsPerMinute);
+
+  Serial.print(", Avg BPM=");
+  Serial.print(beatAvg);
+
+  Serial.print(", Step=");
+  Serial.print(stepDetected ? "YES" : "NO");
+
+  if (irValue < 50000) {
+    Serial.print(" No finger?");
+  }
+
+  Serial.println();
+
+  delay(20);
+}
+
+// =====================================================
+// STEP DETECTION FUNCTION
+// =====================================================
+void updateStepDetection(unsigned long now) {
+  int xRaw = ReadAxis(xInput);
+  int yRaw = ReadAxis(yInput);
+  int zRaw = ReadAxis(zInput);
+
+  // Convert raw values to roughly -3g to +3g
+  float xAccel = map(xRaw, RawMin, RawMax, -3000, 3000) / 1000.0;
+  float yAccel = map(yRaw, RawMin, RawMax, -3000, 3000) / 1000.0;
+  float zAccel = map(zRaw, RawMin, RawMax, -3000, 3000) / 1000.0;
+
+  // Magnitude of acceleration
+  float accelMag = sqrt((xAccel * xAccel) + (yAccel * yAccel) + (zAccel * zAccel));
+
+  // Low-pass baseline to remove gravity / slow changes
+  accelBaseline = (0.95 * accelBaseline) + (0.05 * accelMag);
+
+  // Difference from baseline is the motion signal
+  accelFiltered = abs(accelMag - accelBaseline);
+
+  stepDetected = false;
+
+  if (accelFiltered > STEP_THRESHOLD && (now - lastStepTime) > STEP_COOLDOWN) {
+    stepDetected = true;
+    lastStepTime = now;
+
+    Serial.print("STEP detected, accelFiltered=");
+    Serial.println(accelFiltered);
+  }
+}
+
+// =====================================================
+// AVERAGED ANALOG READ
+// =====================================================
+int ReadAxis(int axisPin) {
+  long reading = 0;
+
+  analogRead(axisPin);
+  delay(1);
+
+  for (int i = 0; i < sampleSize; i++) {
+    reading += analogRead(axisPin);
+  }
+
+  return reading / sampleSize;
+}
