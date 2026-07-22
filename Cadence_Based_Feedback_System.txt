@@ -1,0 +1,956 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+#include <driver/i2s_std.h>
+
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// =====================================================
+// FINAL ESP32 CADENCE FEEDBACK SYSTEM
+// 
+// =====================================================
+
+// --------------------- MAX30102 I2C BUS 0 ---------------------
+#define MAX30102_SDA 21
+#define MAX30102_SCL 22
+
+// --------------------- SSD1306 OLED I2C BUS 1 ---------------------
+// Matches CombinedLCDMAX.txt
+#define OLED_SDA 18
+#define OLED_SCL 19
+
+// --------------------- KY-040 ENCODER ---------------------
+#define ENCODER_CLK 32
+#define ENCODER_DT  33
+#define ENCODER_SW  25
+
+// --------------------- ADXL335 ANALOG OUTPUTS ---------------------
+#define ADXL_X 34
+#define ADXL_Y 35
+#define ADXL_Z 36
+
+// --------------------- PCM5102 I2S ---------------------
+#define I2S_BCK_PIN  14
+#define I2S_WSEL_PIN 26
+#define I2S_DATA_PIN 27
+#define I2S_PORT I2S_NUM_0
+
+i2s_chan_handle_t i2sTxChannel = nullptr;					//related to avoid error that sprung up in audio driver							
+
+// ==========================================================================================
+// I2C OBJECTS
+// Each I2C device has its own ESP32 hardware I2C bus since sharing SDA and SCL did not work.
+// ==========================================================================================
+
+TwoWire I2C_MAX = TwoWire(0);
+TwoWire I2C_OLED = TwoWire(1);
+MAX30105 particleSensor;
+
+// =====================================================
+// SSD1306 OLED SETTINGS 
+// =====================================================
+
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define OLED_ADDR     0x3C
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &I2C_OLED,
+  OLED_RESET
+);
+
+// =====================================================
+// USER / WORKOUT SETTINGS
+// =====================================================
+
+int desiredHR = 80;								//Default "desired heartrate"
+float targetHR = 80.0f;								//Heartrate used by the controller
+float restingHR = 60.0f;					
+
+bool workoutStarted = false;
+
+// Initial metronome cadence.
+float commandedCadence = 100.0f;
+
+const float MIN_CADENCE = 50.0f;						//Lowest cadence allowed
+const float MAX_CADENCE = 250.0f;						//Highest cadence allowed
+const float MAX_CADENCE_CHANGE = 15.0f;						//Highest change in cadence allowed
+
+// Recalculate cadence every 10 seconds.
+const unsigned long CONTROL_INTERVAL_MS = 10000;
+
+// =====================================================
+// ENCODER STATE
+// =====================================================
+
+int lastCLKState = HIGH;							//Stores last state of encoder clk pin to check if it was turned
+bool lastButtonState = HIGH;							//Stores last state of encoder button pin to check if it was pressed, High means not pressed
+
+unsigned long lastEncoderMove = 0;						//Stores time of recent turn for debouncing
+unsigned long lastButtonPress = 0;						//Stores time of recent press for debouncing
+
+const unsigned long ENCODER_DEBOUNCE_MS = 5;					//minimum time of most recent encoder turn
+const unsigned long BUTTON_DEBOUNCE_MS = 250;					//minimum time of most recent encoder press
+
+// =====================================================
+// HEART-RATE SETTINGS / STATE
+// =====================================================
+
+const long FINGER_THRESHOLD = 30000;						//Minimum IR value required to assume a finger is placed on sensor.
+const float MIN_VALID_HR = 60.0f;						//Lowest heart rate value that will be accepted
+const float MAX_VALID_HR = 220.0f;						//Highest heart rate value that will be accepted
+
+unsigned long lastBeatTime = 0;							//time in milliseconds when last heartbeat was detected
+float instantaneousBPM = 0.0f;							//Most recent heartrate calculated
+float displayedBPM = 0.0f;							//Saved BPM that could be changed before displayed
+long latestIR = 0;								//Most recent IR reading
+
+// =====================================================
+// ADXL335 SETTINGS / STATE
+// =====================================================
+
+const int ADC_MIN = 0;								//Lowest ADC reading ESP can see
+const int ADC_MAX = 4095;							//Highest 12-bit ADC reading 
+const int ADXL_SAMPLE_COUNT = 5;						//Number of readings averaged together from each ADXL335 axis
+
+// values used for proof of concept.
+const float STEP_THRESHOLD = 0.35f;						//minimum acceleration change in order for movement to count as a step.
+const unsigned long STEP_COOLDOWN_MS = 250;					//minimum allowed time between detected steps as a form of debouncing
+
+unsigned long lastStepTime = 0;							//Stored time of last step
+float accelerationBaseline = 1.0f;						//Acceleration of gravity
+float accelerationFiltered = 0.0f;						//Acceleration_detected - acceleration_of_gravity
+float latestMeasuredCadence = 0.0f;						//Most recent cadence in steps per minute
+
+// =====================================================
+// MEASUREMENT BUFFERS
+// =====================================================
+
+const int BUFFER_SIZE = 9;							//Max number if heartrate and cadence measurements stored
+
+float heartRateBuffer[BUFFER_SIZE];						//Array that stores valid heartrate measurements in beats per minute
+float cadenceBuffer[BUFFER_SIZE];						//Array that stores valid cadence measurements in steps per minute
+
+int heartRateIndex = 0;
+int cadenceIndex = 0;
+int heartRateCount = 0;								//Number of valid heartrate measurments
+int cadenceCount = 0;								//Number of valid cadence measurments
+
+float previousMeasuredCadence = 100.0f;						//last cadence measurements. initial is 100
+bool previousCadenceValid = false;
+
+// =====================================================
+// CONTROL / DISPLAY TIMING
+// =====================================================
+
+unsigned long lastControlUpdate = 0;						//Time cadence was last updated
+unsigned long lastOLEDUpdate = 0;						//Time when OLED was refreshed
+const unsigned long OLED_UPDATE_MS = 250;					//Time between OLED refreshes
+
+// =====================================================
+// PCM5102 AUDIO SETTINGS
+// =====================================================
+
+const int AUDIO_SAMPLE_RATE = 44100;						//Sample rate of 44,100hz
+const int TONE_FREQUENCY = 500;							//500hz frequency
+const int TONE_DURATION_MS = 40;						//Sound lasts 40 Ms
+const int16_t AUDIO_VOLUME = 9000;						//Volume. Max is around 30,000. 9000 already seems too high
+
+unsigned long metronomeIntervalMs = 600;					//time between metronome beeps
+unsigned long lastMetronomeBeat = 0;						//time when metronome was last played
+
+// =====================================================
+// FUNCTION DECLARATIONS
+// =====================================================
+
+void setupMAX30102();
+void setupADXL335();
+void setupI2S();
+void setupOLED();
+
+void updateEncoder(unsigned long now);
+void startWorkout(unsigned long now);
+void stopWorkout();
+
+void updateHeartRate(unsigned long now);
+void updateStepDetection(unsigned long now);
+void updateCadenceController(unsigned long now);
+void updateMetronome(unsigned long now);
+void updateOLED(unsigned long now);
+
+int readAveragedAxis(int pin);
+void addHeartRateSample(float bpm);
+void addCadenceSample(float cadence);
+void resetMeasurementBuffers();
+
+float calculateMedian(const float values[], int count);
+float clampFloat(float value, float minimum, float maximum);
+
+void setMetronomeCadence(float cadence);
+void playBeep(int frequency, int durationMs);
+
+void drawOLEDMessage(const char *line1, const char *line2);
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);								//Baud rate for serial monitor
+  delay(1000);
+
+//Initialize serial monitor
+  Serial.println();						
+  Serial.println("Final cadence feedback system starting...");	
+
+//initialize encoder
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  pinMode(ENCODER_SW, INPUT_PULLUP);
+  lastCLKState = digitalRead(ENCODER_CLK);
+
+  // Separate I2C buses: MAX30102 on bus 0 and OLED on bus 1.
+  I2C_MAX.begin(MAX30102_SDA, MAX30102_SCL, 400000);
+  I2C_OLED.begin(OLED_SDA, OLED_SCL, 100000);
+
+  setupOLED();
+  drawOLEDMessage("Initializing", "Please wait");
+
+  setupADXL335();
+  setupMAX30102();
+  setupI2S();
+
+  setMetronomeCadence(commandedCadence);
+
+  drawOLEDMessage("Select Heart Rate", "Turn, then push");
+
+  Serial.println("System ready.");
+  Serial.println("Turn encoder to select HR, then push to start.");
+}
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+  unsigned long now = millis();							//Time since esp32 has started for synchronization clock for other components
+
+  updateEncoder(now);								//Check for encoder movement both press and turn
+  updateHeartRate(now);								//Check for heart beat detections
+  updateStepDetection(now);							//Reads the ADXL
+
+  if (workoutStarted) {								//When encoder button first pressed run the metronome
+    updateMetronome(now);							//Check to play sound or not
+    updateCadenceController(now);						//Recalculate cadence
+  }
+
+  updateOLED(now);								//Update display values
+
+  delay(5);
+}
+
+// =====================================================
+// WORKOUT START / STOP
+// =====================================================
+
+void startWorkout(unsigned long now) {				
+  targetHR = (float)desiredHR;							//Copy targetHR from encoder
+  workoutStarted = true;							//turns metronome on 
+
+//Initialization
+  commandedCadence = 100.0f;					
+  previousMeasuredCadence = 100.0f;				
+  previousCadenceValid = false;					
+  latestMeasuredCadence = 0.0f;
+
+  resetMeasurementBuffers();
+  setMetronomeCadence(commandedCadence);
+
+  lastControlUpdate = now;
+  lastMetronomeBeat = now;
+
+  Serial.println();
+  Serial.println("========== WORKOUT STARTED ==========");
+  Serial.print("Target HR = ");
+  Serial.println(targetHR, 1);
+  Serial.println("=====================================");
+}
+
+void stopWorkout() {
+  workoutStarted = false;							//turns off metronome
+
+  // Send silence to stop the metronome output.
+  if (i2sTxChannel != nullptr) {
+    int16_t silence[128 * 2] = {0};
+    size_t bytesWritten = 0;
+    i2s_channel_write(
+      i2sTxChannel,
+      silence,
+      sizeof(silence),
+      &bytesWritten,
+      portMAX_DELAY
+    );
+  }
+
+  resetMeasurementBuffers();
+
+  Serial.println();
+  Serial.println("Workout stopped. Encoder editing enabled.");
+}
+
+// =====================================================
+// ENCODER
+// Turn to select desired HR. Push to start/stop.
+// =====================================================
+
+void updateEncoder(unsigned long now) {				
+  int currentCLK = digitalRead(ENCODER_CLK);					//Read encoder 
+
+  if (!workoutStarted && currentCLK != lastCLKState && currentCLK == LOW) {	//Allows heartrateadjustment only when the workout is not running. negedge clk
+    if (now - lastEncoderMove >= ENCODER_DEBOUNCE_MS) {				//Movement is valid only if enough time has passed
+      lastEncoderMove = now;							//Saves time of encoder movement
+
+      int direction =
+          (digitalRead(ENCODER_DT) != currentCLK) ? 1 : -1;			//Reads the DT pin to determine encoder was turned left or right
+
+      desiredHR += direction;							//Increase or decrease desired HR by one 
+      desiredHR = constrain(desiredHR, 60, 200);				//Window of accepted inputted values
+
+      Serial.print("Desired HR = ");						//Serial monitor display
+      Serial.println(desiredHR);
+    }
+  }
+
+  lastCLKState = currentCLK;							//Stores clk value for comparison of next reading
+
+  bool buttonState = digitalRead(ENCODER_SW);					//Read the encoder
+
+  if (lastButtonState == HIGH && buttonState == LOW) {				//Detects when the pressed button is released
+    if (now - lastButtonPress >= BUTTON_DEBOUNCE_MS) {				//Accepts press if enough time has passed
+      lastButtonPress = now;							//Saves the time of the valid press
+
+      if (!workoutStarted) {							//Check if workout is still ongoing
+        startWorkout(now);							//Starts workout when button is pressed
+      } else {
+        stopWorkout();
+      }
+    }
+  }
+
+  lastButtonState = buttonState;						//Stores button state for when it is pressed again later
+}
+
+// =====================================================
+// MAX30102 SETUP
+// =====================================================
+
+void setupMAX30102() {
+  Serial.println("Initializing MAX30102...");
+
+  if (!particleSensor.begin(I2C_MAX, I2C_SPEED_FAST)) {				//Residual code while debugging better to not remove
+    drawOLEDMessage("MAX30102 ERROR", "Check wiring");
+    Serial.println("MAX30102 not found. Check wiring and power.");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  particleSensor.setup();							
+  particleSensor.setPulseAmplitudeRed(0x0A);					//turns on LED on PPG value from datasheet
+  particleSensor.setPulseAmplitudeGreen(0);
+
+  Serial.println("MAX30102 ready.");
+}
+
+// =====================================================
+// ADXL335 SETUP
+// =====================================================
+
+void setupADXL335() {
+  analogReadResolution(12);							//12 bit ADC resolution from the ESP32
+
+//Axis initialization
+//This also appears in the main loop for the ADXL
+//this is for AT REST 
+  analogSetPinAttenuation(ADXL_X, ADC_11db);
+  analogSetPinAttenuation(ADXL_Y, ADC_11db);
+  analogSetPinAttenuation(ADXL_Z, ADC_11db);
+
+  float baselineSum = 0.0f;							//Default sum of acceleration from all axis
+
+  for (int i = 0; i < 50; i++) {						//Sampling each axis and average
+    int xRaw = readAveragedAxis(ADXL_X);		
+    int yRaw = readAveragedAxis(ADXL_Y);
+    int zRaw = readAveragedAxis(ADXL_Z);
+
+    float xAccel =
+        map(xRaw, ADC_MIN, ADC_MAX, -3000, 3000) / 1000.0f;			//converts value to an acceleration of +-3g
+    float yAccel =
+        map(yRaw, ADC_MIN, ADC_MAX, -3000, 3000) / 1000.0f;			//converts value to an acceleration of +-3g
+    float zAccel =
+        map(zRaw, ADC_MIN, ADC_MAX, -3000, 3000) / 1000.0f;			//converts value to an acceleration of +-3g
+
+    float magnitude =
+        sqrtf(xAccel * xAccel + yAccel * yAccel + zAccel * zAccel);		//total acceleration magnitude
+
+    baselineSum += magnitude;							//Add magnitude to calibration total
+    delay(10);
+  }
+
+  accelerationBaseline = baselineSum / 50.0f;					//Average acceleration magnitude
+
+  Serial.print("ADXL335 ready. Initial baseline = ");				//Serial monitor print
+  Serial.println(accelerationBaseline, 3);
+}
+
+// =====================================================
+// PCM5102 I2S SETUP
+// =====================================================
+
+void setupI2S() {
+  // Errors appeared while compiling regarding the PCM5102 being outdated even though it was fine before
+  // Most of this is residual code to find and the issue of the driver while debugging
+  // The debugging and initialization is mixed together so it is best to not remove or change this segment of code.
+  i2s_chan_config_t channelConfig =
+      I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
+
+  esp_err_t result =
+      i2s_new_channel(&channelConfig, &i2sTxChannel, nullptr);
+
+  if (result != ESP_OK) {
+    drawOLEDMessage("I2S CHANNEL ERR", "Driver setup");
+    Serial.print("Failed to create I2S TX channel: ");
+    Serial.println(esp_err_to_name(result));
+    while (true) delay(1000);
+  }
+
+  i2s_std_config_t stdConfig = {
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+        I2S_DATA_BIT_WIDTH_16BIT,
+        I2S_SLOT_MODE_STEREO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)I2S_BCK_PIN,
+      .ws   = (gpio_num_t)I2S_WSEL_PIN,
+      .dout = (gpio_num_t)I2S_DATA_PIN,
+      .din  = I2S_GPIO_UNUSED,
+      .invert_flags = {
+        .mclk_inv = false,
+        .bclk_inv = false,
+        .ws_inv   = false
+      }
+    }
+  };
+
+  result = i2s_channel_init_std_mode(i2sTxChannel, &stdConfig);
+
+  if (result != ESP_OK) {
+    drawOLEDMessage("I2S MODE ERROR", "Check ESP core");
+    Serial.print("Failed to initialize I2S STD mode: ");
+    Serial.println(esp_err_to_name(result));
+    while (true) delay(1000);
+  }
+
+  result = i2s_channel_enable(i2sTxChannel);
+
+  if (result != ESP_OK) {
+    drawOLEDMessage("I2S ENABLE ERR", "Check ESP core");
+    Serial.print("Failed to enable I2S channel: ");
+    Serial.println(esp_err_to_name(result));
+    while (true) delay(1000);
+  }
+
+  Serial.println("PCM5102 I2S ready using new ESP-IDF driver.");
+}
+
+// =====================================================
+// HEART-RATE DETECTION
+// =====================================================
+
+void updateHeartRate(unsigned long now) {
+  latestIR = particleSensor.getIR();
+
+  if (latestIR < FINGER_THRESHOLD) {						//Check if reading finger
+    displayedBPM = 0.0f;							//Clear previous value
+    lastBeatTime = 0;								//Clear previous value
+    return;
+  }
+
+  if (!checkForBeat(latestIR)) {						//Pass IR reading to beat detection algorithm
+    return;
+  }
+
+  if (lastBeatTime == 0) {							//Check if last heart beat was valid
+    lastBeatTime = now;								//Save time of valid beat
+    return;
+  }
+
+  unsigned long beatInterval = now - lastBeatTime;				//Calculate time between beats
+  lastBeatTime = now;								//Save time of valid beat
+
+  if (beatInterval == 0) {							//Prevents division by 0
+    return;
+  }
+
+  instantaneousBPM = 60000.0f / beatInterval;					//converts heartbeat interval from milliseconds to BPM
+
+  if (instantaneousBPM >= MIN_VALID_HR &&					//Checks if the measurement is within the allowed heartrate range
+      instantaneousBPM <= MAX_VALID_HR) {
+
+    displayedBPM = instantaneousBPM;						//Saves value for display
+
+    if (workoutStarted) {							//Stores measurement buffer
+      addHeartRateSample(instantaneousBPM);
+    }
+
+    Serial.print("[HR] BPM = ");						//Serial monitor print
+    Serial.println(instantaneousBPM, 1);
+  }
+}
+
+// =====================================================
+// ADXL335 STEP / CADENCE DETECTION
+// =====================================================
+
+void updateStepDetection(unsigned long now) {
+  int xRaw = readAveragedAxis(ADXL_X);
+  int yRaw = readAveragedAxis(ADXL_Y);
+  int zRaw = readAveragedAxis(ADXL_Z);
+
+  float xAccel =
+      map(xRaw, ADC_MIN, ADC_MAX, -3000, 3000) / 1000.0f;
+  float yAccel =
+      map(yRaw, ADC_MIN, ADC_MAX, -3000, 3000) / 1000.0f;
+  float zAccel =
+      map(zRaw, ADC_MIN, ADC_MAX, -3000, 3000) / 1000.0f;
+
+  float accelerationMagnitude =
+      sqrtf(xAccel * xAccel + yAccel * yAccel + zAccel * zAccel);
+
+  accelerationBaseline =							//Updates the baseline acceleration to stay consistant with 1g of force
+      0.95f * accelerationBaseline +
+      0.05f * accelerationMagnitude;
+
+  accelerationFiltered =
+      fabsf(accelerationMagnitude - accelerationBaseline);			//Calculate difference between acceleration magnitude and changing baseline
+
+  bool cooldownComplete =							//Check if enough time has passed to prevent multiple movements from counting
+      now - lastStepTime >= STEP_COOLDOWN_MS;
+
+  if (accelerationFiltered > STEP_THRESHOLD && cooldownComplete) {		//Check if step is valid
+    if (lastStepTime > 0) {							//Check if there was a valid step before calculating cadence
+      unsigned long stepInterval = now - lastStepTime;				//Calculate time between steps
+
+      if (stepInterval > 0) {							//Prevents division by 0
+        float candidateCadence = 60000.0f / stepInterval;			//Convert time between steps to steps per minute
+
+        if (candidateCadence >= MIN_CADENCE &&					//Accept cadence if it is in between the valid range
+            candidateCadence <= MAX_CADENCE) {
+
+          latestMeasuredCadence = candidateCadence;				//Save cadence
+
+          if (workoutStarted) {							//Store cadence measurments only if workout is active
+            addCadenceSample(candidateCadence);
+          }
+
+          Serial.print("[STEP] Measured cadence = ");				//Serial monitor print
+          Serial.print(candidateCadence, 1);
+          Serial.print(" SPM, motion = ");
+          Serial.println(accelerationFiltered, 3);
+        }
+      }
+    }
+
+    lastStepTime = now;								//Save step time for next cadence calculation
+  }
+}
+
+// =====================================================
+// CADENCE CONTROLLER
+// Multiplicative control 
+// =====================================================
+
+void updateCadenceController(unsigned long now) {
+  if (now - lastControlUpdate < CONTROL_INTERVAL_MS) {				//Check if enough time has passed to update cadence
+    return;
+  }
+
+  lastControlUpdate = now;							//Save current time of update
+
+  Serial.println();
+  Serial.println("========== CONTROL UPDATE ==========");			
+
+  if (heartRateCount < 2 || cadenceCount < 2) {					//Checks whether fewer than 2 valid hear rate and beat samples were collected
+    if (heartRateCount < 2) {
+      Serial.println("Not enough valid heart-rate samples.");			//Change heartRateCount/cadenceCount instances to 1 if message keeps appearing
+    }
+
+    if (cadenceCount < 2) {							//Check whether enough cadence measurments were taking
+      Serial.println("Not enough valid cadence samples.");			//Appears when there is no movement.
+    }
+
+    Serial.println("Keeping previous cadence command.");			//User is either matching required cadence or no movement has happened to change the cadence
+    resetMeasurementBuffers();
+    Serial.println("====================================");
+    return;
+  }
+
+  float measuredHeartRate =							//Calculates the median of valid heart ratesamples
+      calculateMedian(heartRateBuffer, heartRateCount);
+
+  float currentMeasuredCadence =						//Calculates the median of valid cadence samples
+      calculateMedian(cadenceBuffer, cadenceCount);
+
+  float cadenceUsedByController =						//Decides whether to use valid cadence otherwise use last cadence
+      previousCadenceValid
+          ? previousMeasuredCadence
+          : currentMeasuredCadence;
+
+  Serial.print("Target HR: ");							//Serial Monitor 
+  Serial.println(targetHR, 1);
+  Serial.print("Measured HR median: ");
+  Serial.println(measuredHeartRate, 1);
+  Serial.print("Measured cadence median: ");
+  Serial.println(currentMeasuredCadence, 1);
+
+  float denominator = measuredHeartRate - restingHR;				//Calculate measured heartrate difference
+  float numerator = targetHR - restingHR;					//Calculate desired heartrate difference
+
+  if (denominator <= 5.0f || numerator <= 0.0f) {				//Rejects unvalid values should the heartrate ratio equate to less than 40
+    Serial.println("Heart-rate values unsafe for controller.");			//Debugging statement
+    Serial.println("Keeping previous cadence command.");			//Similar case to no movement resulting in no change in cadence
+  } else {
+    float heartRateRatio = numerator / denominator;				//Calculate multiplicative heart rate ratio
+
+    float proposedCadence =							//Calculate new cadence
+        cadenceUsedByController * heartRateRatio;				
+
+    proposedCadence =								//Ensure new cadence is still with in valid cadence range
+        clampFloat(proposedCadence, MIN_CADENCE, MAX_CADENCE);			
+
+    proposedCadence =								//Makes sure range of change in cadence doesn't explode
+        clampFloat(
+          proposedCadence,
+          commandedCadence - MAX_CADENCE_CHANGE,
+          commandedCadence + MAX_CADENCE_CHANGE
+        );
+
+    Serial.print("Cadence used by controller: ");
+    Serial.println(cadenceUsedByController, 1);
+    Serial.print("HR adjustment ratio: ");
+    Serial.println(heartRateRatio, 3);
+    Serial.print("Old command: ");
+    Serial.println(commandedCadence, 1);
+
+    commandedCadence = proposedCadence;						//Updates cadence
+    setMetronomeCadence(commandedCadence);					//Updates cadence time for audio
+
+    Serial.print("New command: ");
+    Serial.print(commandedCadence, 1);
+    Serial.println(" SPM");
+  }
+
+  previousMeasuredCadence = currentMeasuredCadence;				//Saves cadence for next update
+  previousCadenceValid = true;							//Sets Cadence as valid
+
+  resetMeasurementBuffers();							//Clear buffers
+
+  Serial.println("====================================");
+  Serial.println();
+}
+
+// =====================================================
+// METRONOME
+// Sets the metronome speed using a cadence value
+// =====================================================
+
+void setMetronomeCadence(float cadence) {
+  cadence = clampFloat(cadence, MIN_CADENCE, MAX_CADENCE);			//Restricts the cadence as to not go below a minimum value
+  metronomeIntervalMs =								//Converts cadence in steps per minute into time
+      (unsigned long)(60000.0f / cadence);
+
+  Serial.print("[METRONOME] Cadence = ");					//Serial print 
+  Serial.print(cadence, 1);
+  Serial.print(" SPM, interval = ");
+  Serial.print(metronomeIntervalMs);
+  Serial.println(" ms");
+}
+
+void updateMetronome(unsigned long now) {					//Checks whether enough time has passed to play the next beep
+  if (now - lastMetronomeBeat < metronomeIntervalMs) {		
+    return;
+  }
+
+  lastMetronomeBeat = now;							//Saves the current time since the previous beep
+  playBeep(TONE_FREQUENCY, TONE_DURATION_MS);					//Plays the beep
+}
+
+// =====================================================
+// PCM5102 BEEP GENERATION
+// Generates and sends a sine wave to the PCM5102  to play a sound to the earbuds
+// =====================================================
+
+void playBeep(int frequency, int durationMs) {
+  const int totalSamples =
+      AUDIO_SAMPLE_RATE * durationMs / 1000;					//Calculates how many audio samples are required for the beep
+
+  int16_t audioBuffer[256 * 2];							//256 samples are stored in both left and right channels
+  int samplesGenerated = 0;							//Tracks how many samples were created and sent
+
+  while (samplesGenerated < totalSamples) {					//Repeats until all samples needed for beep have been generated
+    int samplesThisBlock =
+        min(256, totalSamples - samplesGenerated);				//Determines how many samples to generate
+
+    for (int i = 0; i < samplesThisBlock; i++) {				//Generate each audio sample for the current block
+      float sampleTime =
+          (float)(samplesGenerated + i) / AUDIO_SAMPLE_RATE;			//Calculate the time position of the current sample in seconds
+
+      int16_t sample =								//Calculate one sine wave audio sample and convert to 16-bit integer
+          (int16_t)(
+            AUDIO_VOLUME *
+            sinf(2.0f * PI * frequency * sampleTime)
+          );
+
+      audioBuffer[i * 2] = sample;						//Store sample in left channel
+      audioBuffer[i * 2 + 1] = sample;						//Store sample in right channel
+    }
+
+    size_t bytesWritten = 0;							//Store how many bytes were sent to channel
+
+    esp_err_t writeResult = i2s_channel_write(					//Sends current block of audio data to the PCM5102
+      i2sTxChannel,
+      audioBuffer,
+      samplesThisBlock * 2 * sizeof(int16_t),					//Calculates the number of bytes to send
+      &bytesWritten,								//Store number of bytes written
+      portMAX_DELAY								//Delay to transmit audio
+    );
+
+    if (writeResult != ESP_OK) {						//Debugging Statement
+      Serial.print("I2S write failed: ");
+      Serial.println(esp_err_to_name(writeResult));
+      return;
+    }
+
+    samplesGenerated += samplesThisBlock;					//Adds the number of samples sent to the running total
+  }
+
+  // Sends silence after the beep so the DAC does not hold the last sample.
+  int16_t silence[128 * 2] = {0};
+  size_t silenceBytesWritten = 0;
+  i2s_channel_write(
+    i2sTxChannel,
+    silence,
+    sizeof(silence),
+    &silenceBytesWritten,
+    portMAX_DELAY
+  );
+}
+
+// =====================================================
+// OLED UPDATE
+// Display to show the user information
+// =====================================================
+
+void updateOLED(unsigned long now) {
+  if (now - lastOLEDUpdate < OLED_UPDATE_MS) {					//Checks whether enough time has passed since the last OLED refresh
+    return;
+  }
+
+  lastOLEDUpdate = now;								//Saves the current time as the most recent OLED update time
+
+  display.clearDisplay();							//Clears display buffer
+  display.setTextColor(SSD1306_WHITE);						//Sets the text to white
+
+  if (!workoutStarted) {							//Runs this section if workout has not started
+    display.setTextSize(1);							//Sets the font size to the smallest value
+    display.setCursor(0, 0);							//Initializes curser to top left corner
+    display.print("Select Heart Rate");						//Print statement
+
+    display.setTextSize(3);							//Sets font size for next statement
+    display.setCursor(35, 22);							//Positions the next statement to these coordinates
+    display.print(desiredHR);							//Print statement
+
+    display.setTextSize(1);							//Sets font size next statement
+    display.setCursor(0, 56);							//Positions the next statement to these coordinates
+    display.print("Turn=change Push=OK");					//Print statement
+  } else {
+    int hrForDisplay =
+        displayedBPM > 0.0f ? (int)roundf(displayedBPM) : 0;			//Creates an heart rate integer for the display. Rounds to nearest whole number
+
+    display.setTextSize(1);							//Sets font size for next statement
+    display.setCursor(0, 0);							//Positions the next statement to these coordinates
+    display.print("Target HR: ");						//Print statement
+    display.print(desiredHR);							//Print statement
+
+    display.setCursor(0, 14);							//Positions the next statement to these coordinates
+    display.print("Current HR: ");						//Print Statement
+    if (hrForDisplay > 0) {
+      display.print(hrForDisplay);						//Checks for valid heartrate
+    } else {
+      display.print("--");						
+    }
+
+    display.setCursor(0, 28);							//Positions the next statement to these coordinates
+    display.print("Measured: ");						//Print statement
+    if (latestMeasuredCadence > 0.0f) {						//Check for  valid cadence
+      display.print((int)roundf(latestMeasuredCadence));
+    } else {
+      display.print("--");
+    }
+    display.print(" SPM");							//Print Statement
+
+    display.setCursor(0, 42);							//Positions the next statement to these coordinates
+    display.print("Command: ");							//Print Statement
+    display.print((int)roundf(commandedCadence));				//Print rounded cadence
+    display.print(" SPM");							//Print Statement
+
+    display.setCursor(0, 56);							//Positions the next statement to these coordinates
+    display.print("Push=Stop");							//Print Statement
+  }
+
+  display.display();								//Send to display
+}
+
+// =====================================================
+// OLED SETUP / MESSAGE HELPERS
+// Setup and debugging
+// Troubles with the correct address
+// =====================================================
+
+void setupOLED() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED failed at address 0x3C.");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  Serial.println("SSD1306 OLED ready on I2C bus 1, address 0x3C.");
+}
+
+void drawOLEDMessage(const char *line1, const char *line2) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 8);
+  display.print(line1);
+
+  display.setCursor(0, 28);
+  display.print(line2);
+
+  display.display();
+}
+
+// =====================================================
+// BUFFER FUNCTIONS
+// =====================================================
+
+void addHeartRateSample(float bpm) {						//Adds a valid heart rate measurement to respective buffer
+  heartRateBuffer[heartRateIndex] = bpm;					//Stores value in index
+  heartRateIndex = (heartRateIndex + 1) % BUFFER_SIZE;				//index returns to o after reaching the end of buffer
+
+  if (heartRateCount < BUFFER_SIZE) {						//Check if buffer is full
+    heartRateCount++;
+  }
+}
+
+void addCadenceSample(float cadence) {						//Adds a valid cadence measurement to the cadence buffer
+  cadenceBuffer[cadenceIndex] = cadence;					//Stores value in index
+  cadenceIndex = (cadenceIndex + 1) % BUFFER_SIZE;				//Index returns to o after reaching the end of buffer
+
+
+  if (cadenceCount < BUFFER_SIZE) {						//Check if buffer is full
+    cadenceCount++;				
+  }
+}
+
+void resetMeasurementBuffers() {						//Reset positions of indices
+  heartRateIndex = 0;
+  cadenceIndex = 0;
+  heartRateCount = 0;
+  cadenceCount = 0;
+}
+
+// =====================================================
+// MEDIAN FILTER
+// =====================================================
+
+float calculateMedian(const float values[], int count) {			//Calculates the median of the measurements store in values
+  if (count <= 0) {
+    return 0.0f;
+  }
+
+  if (count > BUFFER_SIZE) {							//Checks if count is greater than buffer size
+    count = BUFFER_SIZE;
+  }
+
+  float sortedValues[BUFFER_SIZE];						//Temporary array to hold a copy
+
+  for (int i = 0; i < count; i++) {						//Repeat for every measurement
+    sortedValues[i] = values[i];
+  }
+
+//Bubble sorting
+  for (int i = 0; i < count - 1; i++) {						
+    for (int j = 0; j < count - i - 1; j++) {
+      if (sortedValues[j] > sortedValues[j + 1]) {
+        float temporary = sortedValues[j];
+        sortedValues[j] = sortedValues[j + 1];
+        sortedValues[j + 1] = temporary;
+      }
+    }
+  }
+
+  if (count % 2 == 0) {
+    return
+        (sortedValues[count / 2 - 1] +
+         sortedValues[count / 2]) /
+        2.0f;
+  }
+
+  return sortedValues[count / 2];
+}
+
+// =====================================================
+// ADXL335 ANALOG AVERAGING
+// =====================================================
+
+int readAveragedAxis(int pin) {							//Reads one axis several times and averages
+  long total = 0;								//Stores the sum of all pins
+
+  analogRead(pin);  								//Discard first reading to initialize
+
+  for (int i = 0; i < ADXL_SAMPLE_COUNT; i++) {					//Repeat reading
+    total += analogRead(pin);
+  }
+
+  return total / ADXL_SAMPLE_COUNT;
+}
+
+// =====================================================
+// GENERAL HELPERS
+// =====================================================
+
+float clampFloat(float value, float minimum, float maximum) {			//clampfloat operation
+  if (value < minimum) {
+    return minimum;
+  }
+
+  if (value > maximum) {
+    return maximum;
+  }
+
+  return value;
+}
