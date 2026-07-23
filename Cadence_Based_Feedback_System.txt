@@ -18,7 +18,6 @@
 #define MAX30102_SCL 22
 
 // --------------------- SSD1306 OLED I2C BUS 1 ---------------------
-// Matches CombinedLCDMAX.txt
 #define OLED_SDA 18
 #define OLED_SCL 19
 
